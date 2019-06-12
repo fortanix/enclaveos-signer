@@ -2,9 +2,9 @@
 enclaveos-singer is an independent utitiliy to sign IBM Cloud Data Shield convertered containers with your Intel enclave production signing key. Please follow code-signing guidelines/rituals from your organization while using this tool.
 
 # Prerequisite 
-You need to get a production enclave signing key from Intel to use this tool.  Follow the instructon below to submit a request to intel. 
+You need to get a production enclave signing key from Intel to use this tool. Follow the instructon below to submit a request to intel. 
 https://software.intel.com/en-us/sgx/request-license
-Also, you may would have to assing ISVSVN and ISVPRODID paramaters for your applicaiton. Intel SGX documentation provides more information on these fields.
+Also, you would have to assing ISVSVN and ISVPRODID paramaters for your applicaiton. Intel SGX documentation provides more information on these fields.
 https://software.intel.com/en-us/blogs/2016/12/20/overview-of-an-intel-software-guard-extensions-enclave-life-cycle
 
 # Installation
