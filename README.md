@@ -16,8 +16,11 @@ Install the dependecies for enclaveos-signer
 `
 # Production signing Flow
 enclave-os signer works with Fortanix converted container images. you can use the tool to sing a converterd container by providing inputs container image and enclave signing keys to cmdline. Please use the tool help to get the details on the flow.
+
 `chmod +x enclaveos-signer`
 `./enclaveos-sginer -h`
+
 For example a production signing request for a converter container would be. 
-``./enclaveos-signer --container <registery>/converter-app-sgx-output <registery>/app-sgx-production --isvsvn <version num> --isvprodid <produt id>  --production -key <path to signing key> 
+
+`./enclaveos-signer --container <registery>/converter-app-sgx-output <registery>/app-sgx-production --isvsvn <version num> --isvprodid <produt id>  --production -key <path to signing key>`
 
