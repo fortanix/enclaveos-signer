@@ -1,5 +1,5 @@
 # enclaveos-signer
-enclaveos-singer is an independent utitiliy to sign IBM Cloud Data Shield convertered containers with your intel enclave production signing keys. Please follow code-signing guidelines/rituals from your organization while using this tool.
+enclaveos-singer is an independent utitiliy to sign IBM Cloud Data Shield convertered containers with your Intel enclave production signing key. Please follow code-signing guidelines/rituals from your organization while using this tool.
 
 # Prerequisite 
 You need to get a production enclave signing key from Intel to use this tool.  Follow the instructon below to submit a request to intel. 
