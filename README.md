@@ -8,5 +8,3 @@ https://software.intel.com/en-us/sgx/request-license
 # Signing Flow
 enclave-os signer works with Fortanix converted container images. you can use the tool to sing a converterd container by providing inputs container image and enclave signing keys to cmdline. Please use the tool help to get the details on the flow.
 
-# Installation
-TBD.
