@@ -17,7 +17,7 @@ Install the dependecies for enclaveos-signer
 `pip3  install -r requirements.txt`
 
 # Production signing Flow
-enclave-os signer works with Fortanix converted container images. you can use the tool to sing a converterd container by providing inputs container image and enclave signing keys to cmdline. Please use the tool help to get the details on the flow.
+enclaveos-signer works with IBM Cloud Data Shield converted container images. you can use the tool to sign a converterd container by providing inputs container image and enclave signing keys to cmdline. Please use the tool help to get the details on the flow.
 
 `chmod +x enclaveos-signer`
 `./enclaveos-sginer -h`
