@@ -1,5 +1,5 @@
 # enclaveos-signer
-enclaveos-singer is an independent utitiliy to sign Datashield convertered containers with your production keys. Please follow code-signing guidelines and rituals from your organization while using this tool.
+enclaveos-singer is an independent utitiliy to sign IBM Cloud Data Shield convertered containers with your intel enclave production signing keys. Please follow code-signing guidelines/rituals from your organization while using this tool.
 
 # Prerequisite 
 You need to get a production enclave signing key from Intel to use this tool.  Follow the instructon below to submit a request to intel. 
@@ -21,7 +21,6 @@ enclave-os signer works with Fortanix converted container images. you can use th
 `chmod +x enclaveos-signer`
 `./enclaveos-sginer -h`
 
-For example a production signing request for a converter container would be. 
+Below is a sample production signing request:
 
 `./enclaveos-signer --container <registery>/converter-app-sgx-output <registery>/app-sgx-production --isvsvn <version num> --isvprodid <produt id>  --production -key <path to signing key>`
-
