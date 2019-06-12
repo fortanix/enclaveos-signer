@@ -8,12 +8,13 @@ Also, you may would have to assing ISVSVN and ISVPRODID paramaters for your appl
 https://software.intel.com/en-us/blogs/2016/12/20/overview-of-an-intel-software-guard-extensions-enclave-life-cycle
 
 # Installation
-The application requires python3 environment on your system.
-You can install pip3 package manager 
+The application requires python3 environment on your system. You should install pip3 package manager 
+
 `sudo apt-get -y install python3-pip`
+
 Install the dependecies for enclaveos-signer
-`pip3  install -r requirements.txt
-`
+`pip3  install -r requirements.txt`
+
 # Production signing Flow
 enclave-os signer works with Fortanix converted container images. you can use the tool to sing a converterd container by providing inputs container image and enclave signing keys to cmdline. Please use the tool help to get the details on the flow.
 
