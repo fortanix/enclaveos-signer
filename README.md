@@ -25,9 +25,10 @@ enclaveos-signer works with IBM Cloud Data Shield converted container images. yo
 `./enclaveos-signer -h`
 
 Application can be signed with debug keys keys for running in SGX debug mode. Below more details from Intel on debug and production enclaves:
+
 https://software.intel.com/en-us/blogs/2016/01/07/intel-sgx-debug-production-prelease-whats-the-difference
 
-During the signing process we generate an Enclave Signature of the application. Enclave signature generation is describe the Intel SGX documentation here.
+During the signing process we generate an Enclave Signature of the application. Enclave signature generation is describe the Intel SGX documentation here:
 
 https://software.intel.com/en-us/node/702979
 
