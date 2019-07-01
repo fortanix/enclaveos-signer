@@ -3,9 +3,11 @@ enclaveos-signer is an independent utility to sign IBM Cloud Data Shield convert
 
 # Prerequisite 
 Request a production enclave signing key from Intel to sign production enclaves. Follow the instruction below to submit a request to Intel. 
+
 https://software.intel.com/en-us/sgx/request-license
 
 Also, you would have to assign ISVSVN and ISVPRODID parameters for your application. Intel SGX documentation provides more information on these fields.
+
 https://software.intel.com/en-us/blogs/2016/12/20/overview-of-an-intel-software-guard-extensions-enclave-life-cycle
 
 # Installation
