@@ -43,6 +43,10 @@ Here is brief on enclave-signer input parameter :
 
 Sample signing request for debug enclaves:
 
+You can generate a debug signig keys (RSA private key size 3072-bit)
+
+`openssl genrsa -3 -out private_rsa_key.pem 3072`
+
 `./enclaveos-signer --container <registery>/converter-app-sgx-output <registery>/app-sgx-production --isvsvn <version num> --isvprodid <produt id> -key <path to signing key>`
 
 Sample signing request for production enclave:
