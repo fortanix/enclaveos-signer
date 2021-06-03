@@ -31,7 +31,12 @@ import tempfile
 import time
 
 
-__version__ = "0.12.651"
+__version__ = "1.20.devel"
+
+# Check docker version
+if not docker.__version__.startswith('4.0'):
+    raise ImportError('Wrong python version. This machine has: docker=={}, when docker==4.0.x is required.' \
+                        .format(docker.__version__))
 
 """ Default / Architectural Options """
 
@@ -46,9 +51,15 @@ TCSSIZE = PAGESIZE
 SSAFRAMESIZE = PAGESIZE
 SSAFRAMENUM = 2
 
+MEMORY_MODEL_FULL = 'full'
+MEMORY_MODEL_MINIMAL = 'minimal'
+
+VALID_MEMORY_MODELS = [ MEMORY_MODEL_FULL, MEMORY_MODEL_MINIMAL ]
+
 ENCLAVE_STACK_SIZE = PAGESIZE * 16
 DEFAULT_ENCLAVE_SIZE = '256M'
 DEFAULT_THREAD_NUM = 4
+DEFAULT_MEMORY_MODEL = MEMORY_MODEL_FULL
 ENCLAVE_HEAP_MIN = 0x10000
 
 DEFAULT_FORTANIX_API_ENDPOINT = 'https://api.amer.smartkey.io'
@@ -106,7 +117,7 @@ def parse_size(s):
 def unsigned_short(inp):
     res = int(inp)
     if res < 0 or res >= pow(2,16):
-         raise argparse.ArgumentTypeError("%s should be between 0 and 2^16 -1" % value)
+         raise argparse.ArgumentTypeError("%s should be between 0 and 2^16 -1" % res)
     return res
 
 """ Reading / Writing Manifests """
@@ -164,150 +175,97 @@ def output_manifest(filename, manifest, manifest_layout):
 """ Loading Enclave Attributes """
 
 def get_enclave_attributes(cmdline_args):
-    sgx_flags = {
-        'FLAG_DEBUG'          : struct.pack("<Q", 0x02),
-        'FLAG_MODE64BIT'      : struct.pack("<Q", 0x04),
-    }
 
-    sgx_xfrms = {
-        'XFRM_LEGACY'         : struct.pack("<Q", 0x03),
-        'XFRM_AVX'            : struct.pack("<Q", 0x06),
-        'XFRM_AVX3'           : struct.pack("<Q", 0xe6),
-        'XFRM_MPX'            : struct.pack("<Q", 0x18),
-    }
+    # TODO: ZIRC-3455 - move constants to C header file
 
-    sgx_miscs = {
-        'MISC_EXINFO'         : struct.pack("<L", 0x01),
-    }
+    # Flags of the ATTRIBUTES Structure used in the SECS, REPORT,
+    # KEYREQUEST and SIGSTRUCT structures.
+    # Reference: Table 37-3 and 37-21 of the Intel 64 & IA-32 architectures
+    # software developer's manual vol 3. 2020 Edition.
+    FLAGS_INIT           = 0x01
+    FLAGS_DEBUG          = 0x02
+    FLAGS_MODE64BIT      = 0x04
+    # Bit 3 is reserved and set in FLAGS_RESERVED
+    FLAGS_PROVISIONKEY   = 0x10
+    FLAGS_EINITTOKEN_KEY = 0x20
+    FLAGS_CET            = 0x40
+    FLAGS_KSS            = 0x80
+    FLAGS_RESERVED       = 0xFFFFFFFFFFFFFF08
 
-    attributes = [
-        'FLAG_DEBUG',
-        'FLAG_MODE64BIT',
-        'XFRM_LEGACY',
-        'XFRM_AVX',
-    ]
+    # Flags used by the XSAVE Feature Request Mask (XFRM) of the ATTRIBUTES
+    # Structure to execute additional instructions
+    # Reference: Section 2.6 and 41.7.2.1
 
-    masks = [
-        'FLAG_DEBUG',
-        'FLAG_MODE64BIT',
-    ]
+    # To enable the use of features like AVX, MPX and AVX-512 a combination
+    # of bits need to be set based on it's dependency and the registers
+    # used by each feature set.
+    # Failing to adhere to these dependencies causes an exception
+    XFRM_FPU_MMX  = 0x01
+    XFRM_SSE      = 0x02
+    XFRM_LEGACY   = XFRM_FPU_MMX | XFRM_SSE # Mandatory for SGX
 
-    # Remove DEBUG from ATTRIBUTES, but not from ATTRIBUTEMASK.
+    # AVX requires SSE, and AVX-512 requires AVX. Zircon currently requires that the CPU have at least
+    # AVX. AVX-512 will be enabled if the CPU we're running on supports it, but is not required. Currently,
+    # AVX-512 is the only feature that we optionally enable. We should also support running on CPUs that
+    # don't have AVX, but that requires additional changes in zircon. ZIRC-4061. These constants only include
+    # the bits associated with the named feature (AVX or AVX-512), so we can construct masks that include or
+    # exclude the bits for just that feature.
+    XFRM_AVX      = 0x04
+    XFRM_AVX_512  = 0xE0
+    XFRM_MPX      = 0x18
+    XFRM_RESERVED = 0xFFFFFFFFFFFFFC00
+
+    # Flags of the MISCSELECT field to set the Extended SSA frame features
+    # to be used
+    # Reference: Section 37.7.2, Table 37-4
+    MISCS_EXINFO   = 0x1
+    MISCS_CPINFO   = 0x2
+    MISCS_RESERVED = 0xFFFFFFFC
+
+    attributes = FLAGS_DEBUG | FLAGS_MODE64BIT
+    xfrms      = XFRM_LEGACY | XFRM_AVX
+
+    # Remove DEBUG from attributes, but not from attribute_mask.
     if cmdline_args.production:
-        attributes.remove('FLAG_DEBUG')
+        attributes = attributes & ~FLAGS_DEBUG
 
-    flags_raw = struct.pack("<Q", 0)
-    flagmask_raw = struct.pack("<Q", 0)
-    xfrms_raw = struct.pack("<Q", 0)
-    miscs_raw = struct.pack("<L", 0)
+    # The attribute mask contains all bits set. This is similar to what the Intel SGX SDK for Linux seems to do.
+    # (They actually clear the 64-bit mask bit, since they support loading 32 and 64 bit enclaves). The bottom bit
+    # is the INIT bit. We used to clear this bit. We suspect that clearing this mask bit causes EINIT to fail with an
+    # SGX_INVALID_ATTRIBUTE error on some CPUs, so we set it now. ZIRC-4384.
+    attribute_mask = 0xFFFFFFFFFFFFFFFF
 
-    for attr in attributes:
-        if attr in sgx_flags:
-            flags_raw = bytes([a | b for a, b in zip(flags_raw, sgx_flags[attr])])
-        if attr in sgx_xfrms:
-            xfrms_raw = bytes([a | b for a, b in zip(xfrms_raw, sgx_xfrms[attr])])
-        if attr in sgx_miscs:
-            miscs_raw = bytes([a | b for a, b in zip(miscs_raw, sgx_miscs[attr])])
+    # xfrms_mask is the mask of bits that must match when the enclave runs. For bits that are 1 in xfrm_mask,
+    # the corresponding bit in xfrm must be the same when the signature was created and when the enclave is run.
+    # For bits that are 0, the corresponding bit in xfrm can differ when the enclave is run compared to what
+    # it was when the signature was signed. This allows some bits to be enforced and some bits to be not enforced.
+    #
+    # The enclave loader must also support optionally enabling any XFRM bits that are made optional here.
+    # See UrtsEnableOptionalFeatures() in urts-framework.c.
+    #
+    # Changing xfrms_mask also requires changing various tests under pal/src/sgx/signer/tests.
+    xfrms_mask     = 0xFFFFFFFFFFFFFFFF & ~(XFRM_AVX_512)
 
-    for attr in masks:
-        if attr in sgx_flags:
-            flagmask_raw = bytes([a | b for a, b in zip(flagmask_raw, sgx_flags[attr])])
+    miscs = 0
+    miscs_mask = 0xFFFFFFFF & ~(MISCS_EXINFO)
+
+    attributes_raw     = struct.pack("<Q", attributes)
+    xfrms_raw          = struct.pack("<Q", xfrms)
+    attribute_mask_raw = struct.pack("<Q", attribute_mask)
+    xfrms_mask_raw     = struct.pack("<Q", xfrms_mask)
+    miscs_raw          = struct.pack("<L", miscs)
+    miscs_mask_raw     = struct.pack("<L", miscs_mask)
 
     debug_print("Attributes:")
-    debug_print("    flags:     %016x" % (int.from_bytes(flags_raw, byteorder='big')))
-    debug_print("    flagmask:  %016x" % (int.from_bytes(flagmask_raw, byteorder='big')))
-    debug_print("    xfrms:     %016x" % (int.from_bytes(xfrms_raw, byteorder='big')))
-    debug_print("    miscs:     %08x"  % (int.from_bytes(miscs_raw, byteorder='big')))
+    debug_print("    attributes:     %016x" % (int.from_bytes(attributes_raw, byteorder='big')))
+    debug_print("    attribute mask: %016x" % (int.from_bytes(attribute_mask_raw, byteorder='big')))
+    debug_print("    xfrms:          %016x" % (int.from_bytes(xfrms_raw, byteorder='big')))
+    debug_print("    xfrms mask:     %016x" % (int.from_bytes(xfrms_mask_raw, byteorder='big')))
+    debug_print("    miscselect:     %08x" % (int.from_bytes(miscs_raw, byteorder='big')))
+    debug_print("    miscs mask:     %08x" % (int.from_bytes(miscs_mask_raw, byteorder='big')))
 
-    return flags_raw, flagmask_raw, xfrms_raw, miscs_raw
-
-
-""" Generate Checksums / Measurement """
-
-def resolve_uri(uri, reader, check_exist=True):
-    orig_uri = uri
-    if uri.startswith('file:'):
-        target = os.path.abspath(uri[5:])
-    else:
-        target = os.path.abspath(uri)
-    if check_exist and not reader.exists(target):
-        raise Exception('Cannot resolve ' + orig_uri + ' or the file does not exist.')
-    return target
-
-def get_checksum(file, reader):
-    digest = hashlib.sha256()
-    with open(reader.get_file(file), 'rb') as f:
-        digest.update(f.read())
-    return digest.digest()
-
-def get_trusted_files(manifest, executable, reader):
-    targets = {}
-
-    # TODO: We need to rework the way that we generate the keys for the
-    # trusted files. sgx.trusted.files.<filename> may not be unique if
-    # there are two trusted files with the same file name but in different
-    # directories.
-    if 'sgx.trusted_files.exec' not in manifest:
-        if executable:
-            exec_output = "file:" + executable
-            manifest['sgx.trusted_files.exec'] = exec_output
-
-    runtime = reader.get_runtime_path()
-
-    # loader.preload can specify a single shared library or executable that will be loaded instead of the shim.
-    if 'loader.preload' in manifest:
-        load_shim = False
-        uri = manifest['loader.preload'].strip()
-        targets['preload'] = (uri, resolve_uri(uri, reader))
-    else:
-        uri = 'file:' + os.path.join(runtime, "bootstrap",
-                                     "libenclaveos-interface.so")
-        # We reserve tags starting with enclaveos for internal use.
-        # manifest files shouldn't use this string.
-        targets["enclaveos_shim"] = (uri, resolve_uri(uri, reader))
-
-    if 'loader.vdso' not in manifest or manifest['loader.vdso'].strip() != 'none':
-        uri = 'file:' + os.path.join(runtime, "bootstrap",
-                                     "libenclaveos-vdso.so")
-        targets["enclaveos_vdso"] = (uri, resolve_uri(uri, reader))
-
-
-    # The preload libraries have their checksums added to the SGX manifest
-    # under the name sgx.trusted_checksum.preload0,
-    # sgx.trusted_checksum.preload1, and so on. The code in init_trusted_files()
-    # in enclave_framework.c processes the preload library list and searches
-    # for the checksums in the same order.
-
-    for (key, val) in manifest.items():
-        if not key.startswith('sgx.trusted_files.'):
-            continue
-        key = key[len('sgx.trusted_files.'):]
-        if key in targets:
-            raise Exception('repeated key in manifest: sgx.trusted_files.' + key)
-        targets[key] = (val, resolve_uri(val, reader))
-
-    for (key, val) in targets.items():
-        (uri, target) = val
-        checksum = binascii.hexlify(get_checksum(target, reader))
-        targets[key] = (uri, target, checksum)
-
-    return targets
-
-def get_trusted_children(manifest):
-    targets = {}
-
-    for (key, val) in manifest.items():
-        if not key.startswith('sgx.trusted_children.'):
-            continue
-        key = key[len('sgx.trusted_children.'):]
-        if key in targets:
-            raise Exception('repeated key in manifest: sgx.trusted_children.' + key)
-
-        target = resolve_uri(val, LocalFileReader())
-        sig = binascii.hexlify(open(target, 'rb').read()[960:992])
-        targets[key] = (val, target, sig)
-
-    return targets
+    return (attributes_raw, attribute_mask_raw, xfrms_raw, xfrms_mask_raw,
+            miscs_raw, miscs_mask_raw)
 
 """ Populate Enclave Memory """
 
@@ -389,7 +347,7 @@ def get_entry_point(filename):
             return entry
 
     assert(0)
-            
+
 class MemoryArea(object):
     def __init__(self, desc, file=None, addr=None, size=None, flags=None, eextend=None, contents=None):
         self.desc = desc
@@ -452,18 +410,19 @@ def create_tls(tls_base, stacks, ssa_base, num_threads):
     layout = bytearray(num_threads * PAGESIZE)
     for t in range(num_threads):
         tls_self = tls_base + PAGESIZE * t
-        initial_stack = stacks[t].addr + ENCLAVE_STACK_SIZE
+        initial_stack_top = stacks[t].addr + ENCLAVE_STACK_SIZE
+        initial_stack_bottom = stacks[t].addr
         fsbase = 0
         ssaframesize = SSAFRAMESIZE
         ssa = ssa_base + ssaframesize * SSAFRAMENUM * t
         gpr = ssa + ssaframesize - SGX_ARCH_GPR_SIZE
-        
-        tls = struct.pack('<QQQQQQ', tls_self, initial_stack, fsbase, ssaframesize, ssa, gpr)
-        layout[0 + t * PAGESIZE : 48 + t * PAGESIZE] = tls
+
+        tls = struct.pack('<QQQQQQQ', tls_self, initial_stack_top, initial_stack_bottom, fsbase, ssaframesize, ssa, gpr)
+        layout[0 + t * PAGESIZE : 56 + t * PAGESIZE] = tls
     return layout
 
 
-def get_memory_areas(manifest, thread_num, libpal, vdso_path, shim_path):
+def get_memory_areas(thread_num, libpal, vdso_path, shim_path):
     areas = []
     areas.append(MemoryArea('ssa', size=thread_num * SSAFRAMESIZE * SSAFRAMENUM,
                             flags=PAGEINFO_R|PAGEINFO_W|PAGEINFO_REG, eextend=True,
@@ -483,15 +442,15 @@ def get_memory_areas(manifest, thread_num, libpal, vdso_path, shim_path):
 
     areas.append(MemoryArea('pal', file=libpal, flags=PAGEINFO_REG, eextend=True))
 
-    if vdso_path is not None:
-        areas.append(MemoryArea('vdso', file=vdso_path, flags=PAGEINFO_REG, eextend=True))
-
     if shim_path is not None:
         areas.append(MemoryArea('shim', file=shim_path, flags=PAGEINFO_REG, eextend=True))
 
+    if vdso_path is not None:
+        areas.append(MemoryArea('vdso', file=vdso_path, flags=PAGEINFO_REG, eextend=True))
+
     return (areas, stacks)
 
-def populate_memory_areas(manifest, enclave_size, areas):
+def populate_memory_areas(memory_model, enclave_size, areas):
     populating = enclave_size
 
     for area in areas:
@@ -507,17 +466,18 @@ def populate_memory_areas(manifest, enclave_size, areas):
             populating = area.addr - MEMORY_GAP
 
     free_areas = []
-    for area in areas:
-        if area.addr + area.size < populating:
-            addr = area.addr + area.size
-            free_areas.append(MemoryArea('free', addr=addr, size=populating - addr,
-                                flags=PAGEINFO_R|PAGEINFO_W|PAGEINFO_X|PAGEINFO_REG, eextend=False))
-            populating = area.addr
+    if memory_model == MEMORY_MODEL_FULL:
+        for area in areas:
+            if area.addr + area.size < populating:
+                addr = area.addr + area.size
+                free_areas.append(MemoryArea('free', addr=addr, size=populating - addr,
+                                    flags=PAGEINFO_R|PAGEINFO_W|PAGEINFO_X|PAGEINFO_REG, eextend=False))
+                populating = area.addr
 
-    if populating > ENCLAVE_HEAP_MIN:
-        free_areas.append(MemoryArea('free', addr=ENCLAVE_HEAP_MIN,
-                                     size=populating - ENCLAVE_HEAP_MIN,
-                                     flags=PAGEINFO_R|PAGEINFO_W|PAGEINFO_X|PAGEINFO_REG, eextend=False))
+        if populating > ENCLAVE_HEAP_MIN:
+            free_areas.append(MemoryArea('free', addr=ENCLAVE_HEAP_MIN,
+                                         size=populating - ENCLAVE_HEAP_MIN,
+                                         flags=PAGEINFO_R|PAGEINFO_W|PAGEINFO_X|PAGEINFO_REG, eextend=False))
 
     return areas + free_areas
 
@@ -663,7 +623,7 @@ def generate_measurement(enclave_size, areas):
                     for er in range(a, a + PAGESIZE, 256):
                         do_eextend(mrenclave, er,
                                    area.contents[er - area.addr:er + 256 - area.addr])
-                
+
             print_area(area.addr, area.size, area.flags, area.desc, area.eextend)
 
     return mrenclave.finalize()
@@ -875,7 +835,7 @@ class SdkmsSigner(object):
                     lambda clnt, req: PluginsApi(clnt).invoke_plugin(self.plugin_id, req),
                     '/sys/v1/plugins/{}'.format(self.plugin_id))
             signature = resp['signature']
-                    
+
         else:
             req = SignRequest(hash=bytearray(digest), hash_alg=DigestAlgorithm.SHA256)
             resp = execute_maybe_approve(api_client, req,
@@ -930,7 +890,8 @@ def fill_sigstruct(cmdline_args, mrenclave):
     debug_print("ISVPRODID: %d" % (isvprodid))
     debug_print("ISVSVN:    %d" % (isvsvn))
 
-    (flags, flagmask , xfrms, miscs) = get_enclave_attributes(cmdline_args)
+    (attr, attrmask, xfrms,
+     xfrmsmask, miscs, miscsmask) = get_enclave_attributes(cmdline_args)
 
     # field format: (offset, type, value)
     sigstruct = {}
@@ -941,9 +902,9 @@ def fill_sigstruct(cmdline_args, mrenclave):
     sigstruct['swdefined'] = (  40, "<L",   SIGSTRUCT_SWDEFINED)
 
     sigstruct['miscs']     = ( 900, "4s",   miscs)
-    sigstruct['miscmask']  = ( 904, "4s",   miscs)
-    sigstruct['attrs']     = ( 928, "8s8s", flags, xfrms)
-    sigstruct['attrmask']  = ( 944, "8s8s", flagmask, xfrms)
+    sigstruct['miscmask']  = ( 904, "4s",   miscsmask)
+    sigstruct['attrs']     = ( 928, "8s8s", attr, xfrms)
+    sigstruct['attrmask']  = ( 944, "8s8s", attrmask, xfrmsmask)
     sigstruct['mrenclave'] = ( 960, "32s",  mrenclave)
     sigstruct['isvprodid'] = (1024, "<H",   isvprodid)
     sigstruct['isvsvn']    = (1026, "<H",   isvsvn)
@@ -960,16 +921,16 @@ def update_sigstruct(cmdline_args, sigstruct):
     if cmdline_args.isvsvn is not None:
         sigstruct['isvsvn'] = (1026, "<H", cmdline_args.isvsvn)
 
-    (flags, flagmask , xfrms, miscs) = get_enclave_attributes(cmdline_args)
-
+    (attr, attrmask, xfrms,
+     xfrmsmask, miscs, miscsmask) = get_enclave_attributes(cmdline_args)
 
     # field format: (offset, type, value)
     sigstruct['date']      = (  20, "<HBB", today.year, today.month, today.day)
 
     sigstruct['miscs']     = ( 900, "4s",   miscs)
-    sigstruct['miscmask']  = ( 904, "4s",   miscs)
-    sigstruct['attrs']     = ( 928, "8s8s", flags, xfrms)
-    sigstruct['attrmask']  = ( 944, "8s8s", flagmask, xfrms)
+    sigstruct['miscmask']  = ( 904, "4s",   miscsmask)
+    sigstruct['attrs']     = ( 928, "8s8s", attr, xfrms)
+    sigstruct['attrmask']  = ( 944, "8s8s", attrmask, xfrmsmask)
 
     return sigstruct
 
@@ -1061,13 +1022,23 @@ def parse_args():
     parser.add_argument('--isvprodid', help='Product id', type=unsigned_short, default=None, dest='isvprodid')
     parser.add_argument('-verbose', action='store_true',
                         help='Print verbose output during signing')
-    parser.add_argument('--container',
+    parser.add_argument('--docker-container', '--container',
                         help='Take files from this container instead of the host (except for the manifest)')
+    parser.add_argument('--buildkit-container-dir',
+                        help='Directory holding files from the container filesystem that are used in the signing process')
     parser.add_argument('--keep-temp-dirs', help='Keep temporary directories instead of deleting', action='store_true')
     parser.add_argument('--plugin-id', help='UUID of SDKMS sign+log plugin')
     parser.add_argument('--build-info', help='File containing build information for SDKMS plugin signing',
                         type=argparse.FileType('r', encoding='utf-8'))
     parser.add_argument('--production', help='Sign a production enclave (ATTRIBUTES.DEBUG = 0)', action='store_true')
+    parser.add_argument('--orig', help='sign a previously unsigned container (default is to re-sign a ' +
+                        'container that was already signed)', action='store_true')
+    parser.add_argument('--memory-model', type=str, choices = [ 'sgx1', 'sgx2', 'all' ],
+                        help='Memory model to use when signing the application. Each memory model requires a ' +
+                        'separate signature. The sgx1 memory model will run on sgx1 and sgx2 hardware. The sgx2 ' +
+                        'memory model will only run on sgx2 memory model. Memory model all can be used to sign with ' +
+                        'all available memory models.',
+                        action='store')
     key_group = parser.add_mutually_exclusive_group(required=True)
     key_group.add_argument('-key', '--key', help='Path to PEM-format signing key')
     key_group.add_argument('--sdkms-key', help='Name of SDKMS signing key. FORTANIX_API_KEY must be set in the environment.')
@@ -1076,6 +1047,15 @@ def parse_args():
     if args.verbose:
         global verbose
         verbose = args.verbose
+
+    # For now, warn if a memory model is not requested. We eventually want to make the default script behavior
+    # to sign with both SGX1 and SGX2 signatures, but we can't change that yet. ZIRC-4580.
+    if args.memory_model is None and not args.orig:
+        args.memory_model = 'sgx1'
+        print('WARNING: No --memory-model option specified. The enclave will be signed with only the SGX1 ' +
+              'memory layout. This default may change in future versions of enclaveos-signer. Run with '
+              '--memory-model=sgx1, --memory-model=sgx2 or --memory-model=all to silence this warning '
+              'and ensure compatibility with future versions of enclaveos-signer\n')
 
     if args.build_info and not args.plugin_id:
         raise ValueError('--build-info does not make sense without --plugin-id')
@@ -1131,8 +1111,7 @@ class DockerFileReader(object):
             (contents, attributes) = self.container.get_archive(filename)
 
             # TODO: It seems like there should be a way to do this without copying into a BytesIO.
-            archive = io.BytesIO()
-            shutil.copyfileobj(contents, archive)
+            archive = io.BytesIO(b''.join(contents))
             archive.seek(0, io.SEEK_SET)
 
             tar = tarfile.open(mode='r', fileobj=archive)
@@ -1163,31 +1142,71 @@ class DockerFileReader(object):
     def exists(self, filename):
         return True
 
+# The BuildkitContainerImageFileReader class provide interfaces for accessing files from the
+# inside a buildkit container image container filesystem
+class BuildkitContainerImageFileReader(object):
+    def __init__(self, container_dir, tmpdir):
+        self.container_dir = container_dir
+        self.tmpdir = tmpdir
+
+    def get_file(self, filename, maxdepth=16):
+        assert len(filename) > 0 and filename[0] == "/"
+        return os.path.join(self.container_dir, filename[1:])
+
+    # When we're signing a container, the runtime files will always be in the runtime location.
+    def get_runtime_path(self):
+        return os.path.join(self.container_dir, "/opt/fortanix/enclave-os")
+
+    # actual file if it does not exist.
+    def exists(self, filename):
+        assert len(filename) > 0 and filename[0] == "/"
+        path = os.path.join(self.container_dir, filename[1:])
+        return os.path.exists(path)
+
+def no_signatures():
+    return {
+        "ENCLAVEOS_SIGNATURE": None,
+        "ENCLAVEOS_SIGNATURE2": None
+    }
+
+def any_signatures(signatures):
+    return (signatures["ENCLAVEOS_SIGNATURE"] is not None or
+            signatures["ENCLAVEOS_SIGNATURE2"] is not None)
+
 def sign_manifest():
     # Parse arguments
     cmdline_args = parse_args()
-
     docker_client = None
     container = None
-    oldsig = None
+    signatures = no_signatures()
     tempdir = make_temp_dir(cmdline_args.keep_temp_dirs)
-    if cmdline_args.container:
+    if cmdline_args.docker_container:
         docker_client = docker.from_env()
-        container = docker_client.containers.create(cmdline_args.container)
+        container = docker_client.containers.create(cmdline_args.docker_container)
         reader = DockerFileReader(container, tempdir.name)
-        oldsig = get_sig(container)
+        signatures = get_sigs(container)
+    # Request for manifest signing for a buildkit image with contents in a local directory
+    elif cmdline_args.buildkit_container_dir:
+        reader = BuildkitContainerImageFileReader(cmdline_args.buildkit_container_dir, tempdir.name)
     else:
         reader = LocalFileReader()
         container = None
 
     try:
-        if oldsig is None:
+        if cmdline_args.orig or container is None:
+            if any_signatures(signatures):
+                raise Exception('container {} already has the {} or {} environment variable set.'.format(
+                    cmdline_args.docker_container, "ENCLAVEOS_SIGNATURE", "ENCLAVEOS_SIGNATURE2") +
+                                'Are you converting an application that was already converted?')
             if cmdline_args.libpal is None or cmdline_args.manifest is None:
                 raise ValueError('the following arguments are required for sigstruct generation: -libpal, -manifest')
 
-            sign_manifest_helper(cmdline_args, container, reader, tempdir.name)
+            sign_manifest_helper(cmdline_args, reader, tempdir.name)
         else:
-            sign_container(cmdline_args, docker_client, container, reader)
+            if not any_signatures(signatures):
+                raise Exception('container {} did not have an {} signature. Was this container converted?'.format(
+                    cmdline_args.docker_container, "EnclaveOS"))
+            sign_container(cmdline_args, docker_client, container, tempdir.name, signatures)
     finally:
         if container:
             container.remove(v=True)
@@ -1198,7 +1217,7 @@ def copy_libpal(tempdir, reader, libpal_path):
     return copied_libpal
 
 def customize_libpal(copied_libpal, enclave_size, libpal_load_addr, manifest_base_addr, manifest_size, vdso_base,
-                     vdso_size, shim_base, shim_size):
+                     vdso_size, shim_base, shim_size, memory_model):
     # There should be only one data segment in the PAL.
     loadcmds = get_loadcmds(copied_libpal)
     data_segment_offset = None
@@ -1218,10 +1237,10 @@ def customize_libpal(copied_libpal, enclave_size, libpal_load_addr, manifest_bas
         # TODO: We don't currently have a way to pick up the structure
         # definition here from the pal-loader.h C header file. They must be
         # kept in sync manually.
-        data = fh.read(0x50)
+        data = fh.read(0x58)
         (orig_size, orig_base, orig_pal_base, orig_manifest_base_addr, orig_manifest_size, orig_vdso_base,
-         orig_vdso_size, orig_shim_base, orig_shim_size, orig_ssa_size) = \
-            struct.unpack('<QQQQQQQQQQ', data)
+         orig_vdso_size, orig_shim_base, orig_shim_size, orig_ssa_size, orig_memory_model) = \
+            struct.unpack('<QQQQQQQQQQQ', data)
 
         # "Fortanix" in ASCII.
         magic = 0x78696e6174726f46
@@ -1235,12 +1254,15 @@ def customize_libpal(copied_libpal, enclave_size, libpal_load_addr, manifest_bas
         assert(orig_shim_base == magic)
         assert(orig_shim_size == magic)
         assert(orig_ssa_size == magic)
+        assert(orig_memory_model == magic)
+
+        memory_model_val = VALID_MEMORY_MODELS.index(memory_model) + 1
 
         fh.seek(data_segment_offset)
         enclave_base = 0
-        fh.write(struct.pack('<QQQQQQQQQQ', enclave_size + enclave_base, enclave_base, libpal_load_addr,
+        fh.write(struct.pack('<QQQQQQQQQQQ', enclave_size + enclave_base, enclave_base, libpal_load_addr,
                              manifest_base_addr, manifest_size, vdso_base, vdso_size, shim_base, shim_size,
-                             SSAFRAMESIZE))
+                             SSAFRAMESIZE, memory_model_val))
 
     return copied_libpal
 
@@ -1297,20 +1319,22 @@ def get_shim_path(manifest, reader):
 # This routine writes the SGX manifest to a file specified with -output on
 # the command line, and writes the sigstruct to a filename derived from
 # the manifest name (e.g. for app.manifest.sgx, writes to app.sig).
-def sign_manifest_helper(cmdline_args, container, reader, tempdir):
+def sign_manifest_helper(cmdline_args, reader, tempdir):
     executable = cmdline_args.executable
     (manifest, manifest_layout) = read_manifest(cmdline_args.manifest)
 
-    if 'sgx.sigfile' in manifest:
-        sigfile = resolve_uri(manifest['sgx.sigfile'], LocalFileReader(), False)
-    else:
-        sigfile = cmdline_args.output
-        for ext in ['.manifest.sgx', '.manifest']:
-            if sigfile.endswith(ext):
-                sigfile = sigfile[:-len(ext)]
-                break
-        sigfile = sigfile + '.sig'
-        manifest['sgx.sigfile'] = 'file:' + os.path.basename(sigfile)
+    if manifest and 'fs.root.uri' not in manifest and os.environ.get('SIGNER_SKIP_VALIDITY_CHECKS', '') != 'On':
+        raise Exception("root uri is not specified in manifest")
+
+    sigfile = cmdline_args.output
+    for ext in ['.manifest.sgx', '.manifest']:
+        if sigfile.endswith(ext):
+            sigfile = sigfile[:-len(ext)]
+            break
+    sigfile = sigfile + '.sig'
+    sigfile_sgx2 = sigfile + '2'
+    manifest['sgx.sigfile'] = 'file:' + os.path.basename(sigfile)
+    manifest['sgx.sigfile2'] = 'file:' + os.path.basename(sigfile_sgx2)
 
     # Get enclave size and thread count from manifest
     if 'sgx.enclave_size' not in manifest:
@@ -1321,48 +1345,44 @@ def sign_manifest_helper(cmdline_args, container, reader, tempdir):
         manifest['sgx.thread_num'] = str(DEFAULT_THREAD_NUM)
     thread_num = parse_int(manifest['sgx.thread_num'])
 
-    # We used to support setting these SIGSTRUCT values via the manifest, but
-    # now we only accept them on the command line. This can be removed at some
-    # point, it is unlikely there is anything trying to use these.
-    for key in ['isvprodid', 'isvsvn', 'debug', 'enable_avx3', 'enable_mpx', 'support_exinfo']:
-        if key in manifest:
-            raise ValueError('Manifest option sgx.{} is no longer supported'.format(key))
+    if 'sgx.memory_model' not in manifest:
+        manifest['sgx.memory_model'] = DEFAULT_MEMORY_MODEL
+    memory_model = manifest['sgx.memory_model']
+    if memory_model not in VALID_MEMORY_MODELS:
+        raise Exception('Invalid memory model: ' + memory_model)
 
-    # Get trusted checksums and measurements
-    debug_print("Trusted files:")
-    for key, val in get_trusted_files(manifest, executable, reader).items():
-        (uri, target, checksum) = val
-        debug_print("    %s %s" % (checksum, uri))
-        manifest['sgx.trusted_checksum.' + key] = checksum.decode('utf-8')
-
-    debug_print("Trusted children:")
-    for key, val in get_trusted_children(manifest).items():
-        (uri, target, mrenclave) = val
-        debug_print("    %s %s" % (mrenclave, uri))
-        manifest['sgx.trusted_mrenclave.' + key] = mrenclave.decode('utf-8')
-
-    copied_pal = copy_libpal(tempdir, reader, cmdline_args.libpal)
-
-    vdso_path = get_vdso_path(manifest, reader)
-    shim_path = get_shim_path(manifest, reader)
-
-    # Try populate memory areas
-    (memory_areas, stacks) = get_memory_areas(manifest, thread_num, copied_pal, vdso_path, shim_path)
-
-    if len([a for a in memory_areas if a.addr is not None]) > 0:
-        manifest['sgx.static_address'] = '1'
-
-    # Add manifest at the top
-    shutil.copy2(cmdline_args.manifest, cmdline_args.output)
+    # We added sgx-related settings to the manifest file above. Output an SGX manifest with
+    # those additional options.
     output_manifest(cmdline_args.output, manifest, manifest_layout)
 
-    manifest_size = os.stat(cmdline_args.output).st_size
+
+    for (memory_model, cur_sigfile) in [ (MEMORY_MODEL_FULL, sigfile), (MEMORY_MODEL_MINIMAL, sigfile_sgx2) ]:
+        copied_pal = copy_libpal(tempdir, reader, cmdline_args.libpal)
+
+        vdso_path = get_vdso_path(manifest, reader)
+        shim_path = get_shim_path(manifest, reader)
+
+        mrenclave = measure_enclave(memory_model, thread_num, enclave_size, copied_pal, vdso_path, shim_path, cmdline_args.output)
+
+        debug_print("Measurement ({}):".format(cur_sigfile))
+        debug_print(b"    " + binascii.hexlify(mrenclave))
+
+        signer = get_signer(cmdline_args)
+        sigstruct = fill_sigstruct(cmdline_args, mrenclave)
+        open(cur_sigfile, 'wb').write(sign_sigstruct(signer, sigstruct))
+    
+
+def measure_enclave(memory_model, thread_num, enclave_size, copied_pal, vdso_path, shim_path, output):
+    # Try populate memory areas
+    (memory_areas, stacks) = get_memory_areas(thread_num, copied_pal, vdso_path, shim_path)
+
+    manifest_size = os.stat(output).st_size
     memory_areas = [
-            MemoryArea('manifest', file=cmdline_args.output,
+            MemoryArea('manifest', file=output,
                        flags=PAGEINFO_R|PAGEINFO_REG, eextend=True)
             ] + memory_areas
 
-    memory_areas = populate_memory_areas(manifest, enclave_size, memory_areas)
+    memory_areas = populate_memory_areas(memory_model, enclave_size, memory_areas)
     entry = get_entry_point(copied_pal)
 
     libpal_load_addr = get_load_addr_by_name(memory_areas, 'pal')
@@ -1390,25 +1410,40 @@ def sign_manifest_helper(cmdline_args, container, reader, tempdir):
         shim_size = get_size_by_name(memory_areas, 'shim')
 
     customize_libpal(copied_pal, enclave_size, libpal_load_addr, manifest_base_addr, manifest_size, vdso_base,
-                     vdso_size, shim_base, shim_size)
+                     vdso_size, shim_base, shim_size, memory_model)
 
-    debug_print("Memory:")
     # Generate measurement
-    mrenclave = generate_measurement(enclave_size, memory_areas)
+    return generate_measurement(enclave_size, memory_areas)
 
-    debug_print("Measurement:")
-    debug_print(b"    " + binascii.hexlify(mrenclave))
-
-    signer = get_signer(cmdline_args)
-    sigstruct = fill_sigstruct(cmdline_args, mrenclave)
-    open(sigfile, 'wb').write(sign_sigstruct(signer, sigstruct))
-
-def get_sig(container):
+# Get the signature(s) from a docker container. There are up to two signatures, one for zircon's SGX1 memory
+# layout, and one for zircon's SGX2 memory layout. A container may have one or both signatures. The converter will
+# by default generate both signatures, but customers can opt to re-sign with just one signature if they know they
+# are only using SGX1 hardware or only using SGX2 hardware.
+def get_sigs(container):
+    signatures = no_signatures()
+    
     if 'Env' in container.attrs['Config']:
         for var in container.attrs['Config']['Env']:
-            if var.startswith('ENCLAVEOS_SIGNATURE='):
-                return base64.b64decode(var[20:])
-    return None
+            try:
+                (key, val) = var.split('=', 1)
+            except ValueError:
+                continue
+
+            for env_var in signatures.keys():
+                if key == env_var:
+                    debug_print('Old signature for {} is {}'.format(env_var, val))
+                    try:
+                        sig = base64.b64decode(val)
+                    except Exception:
+                        raise Exception('Unable to base64 decode old signature {}'.format(val))
+                    signatures[env_var] = sig
+
+                    # Both environment variables found, bail out early.
+                    if signatures["ENCLAVEOS_SIGNATURE"] and signatures["ENCLAVEOS_SIGNATURE2"]:
+                        return signatures
+
+    return signatures
+
 
 # Read an existing SIGSTRUCT from a container, resign it, and build a new
 # docker image with the new signature. This is useful for applying
@@ -1416,28 +1451,71 @@ def get_sig(container):
 #
 # Note that unlike sign_manifest_helper, output in this case is a docker
 # image held by the local docker daemon.
-def sign_container(cmdline_args, docker_client, container, reader):
-    oldsig = get_sig(container)
-    if oldsig is None:
-        raise ValueError('Container does not have the ENCLAVEOS_SIGNATURE environment variable')
-    sigstruct = read_sigstruct(io.BytesIO(oldsig))
+def sign_container(cmdline_args, docker_client, container, temp_dir, signatures):
+    use_buildkit = False
 
-    # Modifies the sigstruct argument based on cmdline args
-    update_sigstruct(cmdline_args, sigstruct)
+    if cmdline_args.memory_model == 'sgx1':
+        need_sigs = [ "ENCLAVEOS_SIGNATURE" ]
+        unneeded_sigs = [ "ENCLAVEOS_SIGNATURE2" ]
+    elif cmdline_args.memory_model == 'sgx2':
+        need_sigs = [ "ENCLAVEOS_SIGNATURE2" ]
+        unneeded_sigs = [ "ENCLAVEOS_SIGNATURE" ]
+    elif cmdline_args.memory_model == 'all':
+        need_sigs = [ "ENCLAVEOS_SIGNATURE", "ENCLAVEOS_SIGNATURE2" ]
+        unneeded_sigs = [ ]
+    else:
+        raise Exception('Unknown requested memory model: "{}"'.format(cmdline_args.memory_model))
 
-    signer = get_signer(cmdline_args)
-    newsig = sign_sigstruct(signer, sigstruct)
+    for env_name in need_sigs:
+        if signatures[env_name] is None:
+            raise ValueError('Container does not have the {} environment variable. '.format(env_name) +
+                             'The container must already have an existing signature to re-sign')
+    
+    with open(os.path.join(temp_dir, 'Dockerfile') ,'wb') as file:
+        file.write(('FROM {}\n'.format(cmdline_args.docker_container)).encode('utf-8'))
 
-    dockerfile = io.BytesIO()
-    dockerfile.write(('FROM {}\n'.format(cmdline_args.container)).encode('utf-8'))
-    dockerfile.write('ENV {} "{}"\n'.format("ENCLAVEOS_SIGNATURE",
-                                            base64.b64encode(newsig).decode('utf-8')).encode('utf-8'))
-    dockerfile.seek(0, io.SEEK_SET)
+        for env_name in need_sigs:
+            sigstruct = read_sigstruct(io.BytesIO(signatures[env_name]))
 
-    final_image = docker_client.images.build(fileobj=dockerfile, rm=True)
+            # Modifies the sigstruct argument based on cmdline args
+            update_sigstruct(cmdline_args, sigstruct)
 
-    (repo, tag) = IMAGE_REGEX.match(cmdline_args.output).groups()
-    final_image.tag(repo, tag)
+            signer = get_signer(cmdline_args)
+            newsig = sign_sigstruct(signer, sigstruct)
 
+            file.write('ENV {} "{}"\n'.format(env_name, base64.b64encode(newsig).decode('utf-8')).encode('utf-8'))
+
+        # To avoid confusion, if it was requested that we sign with just an SGX1 or just an SGX2 signature, we
+        # drop the other signature.   
+        for env_name in unneeded_sigs:
+            file.write('ENV {} ""\n'.format(env_name).encode('utf-8'))
+
+    # Possibly confusing: the "-output" command-line argument to the script is a file name when signing for
+    # the first time, but a docker repository specifier (with required remote repository) when re-signing
+    # an application. So if the script gets invoked in the wrong way, it can lead to us trying to parse a file
+    # path as a docker registry name, which might not work. So throw a more informative exception if the
+    # parsing fails. MAL-3134 / ZIRC-4572.
+    match = IMAGE_REGEX.match(cmdline_args.output)
+    if match is None or len(match.groups()) != 2:
+        raise Exception('Unable to parse docker repository specifier "{}"'.format(cmdline_args.output))
+    (repo, tag) = match.groups()
+
+    # Using the 'buildkit' for building the output image, this logic is inactive and not tested
+    if use_buildkit:
+        # Buildkit deamon socket
+        ip = os.environ['BUILDKIT_IP']
+        port = os.environ['BUILDKIT_TCP_PORT']
+        buildkit_host = "tcp://" + ip + ":" + port
+        # Building the new image with the production signature using buildkit
+        # Todo: does production signing requests image need credentials for pulling?
+        buildkit_cmd = ["buildctl", "--addr", buildkit_host, "build", "--progress", "plain", "--frontend=dockerfile.v0",
+                        "--local", "context={}".format(temp_dir), "--local", "dockerfile={}".format(temp_dir),
+                        "--output", "type=docker,name={}:{}".format(repo, tag)]
+        buildkit_op = subprocess.check_output(buildkit_cmd)
+    # Using the 'docker' for building the output image
+    else:
+        dockerfile = open(os.path.join(temp_dir, 'Dockerfile') ,'rb')
+        (final_image, _) = docker_client.images.build(fileobj=dockerfile, rm=True)
+        final_image.tag(repo, tag)
 if __name__ == "__main__":
     sign_manifest()
