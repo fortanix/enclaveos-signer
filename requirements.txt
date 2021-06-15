@@ -1,2 +1,3 @@
-sdkms-cli==2.19.993
-docker~=2.6.1
+cryptography~=2.3.1
+docker~=4.0.2
+sdkms-cli~=3.22.1383
